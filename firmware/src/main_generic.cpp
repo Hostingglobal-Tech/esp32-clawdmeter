@@ -25,7 +25,7 @@
 
 #define DEVICE_NAME "Claude Controller"
 #define FIRMWARE_NAME "Clawdmeter generic OLED firmware"
-#define FIRMWARE_VERSION "0.3.0"
+#define FIRMWARE_VERSION "0.3.1"
 #define SERVICE_UUID "4c41555a-4465-7669-6365-000000000001"
 #define RX_CHAR_UUID "4c41555a-4465-7669-6365-000000000002"
 #define TX_CHAR_UUID "4c41555a-4465-7669-6365-000000000003"
@@ -90,6 +90,7 @@ static const char *active_name() {
 static const char *usage_state_label(const UsageData *u) {
     if (!u->valid) return "NO DATA";
     if (strcmp(u->status, "limited") == 0) return "LIMITED";
+    if (strcmp(u->status, "left") == 0) return "LEFT";
     if (strcmp(u->status, "est") == 0) return "EST";
     if (u->session_pct >= 75.0f || u->weekly_pct >= 85.0f) return "HIGH";
     if (u->session_pct >= 50.0f || u->weekly_pct >= 65.0f) return "WATCH";

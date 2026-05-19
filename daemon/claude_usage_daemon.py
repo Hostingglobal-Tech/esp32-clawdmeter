@@ -10,11 +10,13 @@ import asyncio
 import getpass
 import json
 import os
+import queue
 import re
 import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -22,7 +24,7 @@ import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEVICE_NAME = "Claude Controller"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
@@ -41,6 +43,7 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 CODEX_LOG_DB = Path(os.environ.get("CODEX_USAGE_SQLITE", Path.home() / ".codex" / "logs_2.sqlite"))
+CODEX_CMD = os.environ.get("CODEX_CMD") or str(Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd")
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -251,13 +254,154 @@ def _pct_used(tokens: int, budget: int) -> int:
     return max(0, min(100, int(round((tokens / budget) * 100))))
 
 
-def poll_codex_usage() -> dict:
-    """Read Codex token usage from the local Codex sqlite log.
+def _reset_minutes_from_epoch(reset_ts: int | float | None) -> int:
+    if reset_ts is None:
+        return -1
+    mins = (float(reset_ts) - time.time()) / 60.0
+    return int(round(mins)) if mins > 0 else 0
 
-    Codex does not currently expose Claude-style rate-limit headers through
-    the CLI, so this is an estimate based on local response.completed log rows.
-    The budgets are intentionally configurable via environment variables.
-    """
+
+def _remaining_percent(used: int | float | None) -> int:
+    if used is None:
+        return 0
+    return max(0, min(100, int(round(100 - float(used)))))
+
+
+def _reader_thread(stream, out_queue: queue.Queue[str]) -> None:
+    try:
+        for line in stream:
+            out_queue.put(line.rstrip("\n"))
+    finally:
+        out_queue.put("")
+
+
+def _codex_app_server_message(method: str, msg_id: str, params: dict | None = None) -> dict:
+    msg = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    return msg
+
+
+def _query_codex_rate_limits() -> dict | None:
+    """Ask Codex's own app-server for the same limit snapshot the TUI uses."""
+    codex_cmd = Path(CODEX_CMD)
+    if not codex_cmd.exists():
+        log(f"Codex command not found: {codex_cmd}")
+        return None
+
+    try:
+        proc = subprocess.Popen(
+            [str(codex_cmd), "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as e:
+        log(f"Codex app-server start failed: {e}")
+        return None
+
+    out_queue: queue.Queue[str] = queue.Queue()
+    err_queue: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=_reader_thread, args=(proc.stdout, out_queue), daemon=True).start()
+    threading.Thread(target=_reader_thread, args=(proc.stderr, err_queue), daemon=True).start()
+
+    def send(msg: dict) -> bool:
+        if proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
+            proc.stdin.flush()
+            return True
+        except OSError:
+            return False
+
+    init = _codex_app_server_message(
+        "initialize",
+        "clawdmeter-init",
+        {
+            "clientInfo": {
+                "name": "clawdmeter",
+                "title": "Clawdmeter",
+                "version": VERSION,
+            },
+            "capabilities": None,
+        },
+    )
+    rate_limits = _codex_app_server_message(
+        "account/rateLimits/read",
+        "clawdmeter-rate-limits",
+    )
+
+    result: dict | None = None
+    deadline = time.time() + 20.0
+    try:
+        if not send(init):
+            return None
+
+        initialized = False
+        while time.time() < deadline:
+            timeout = max(0.1, min(0.5, deadline - time.time()))
+            try:
+                line = out_queue.get(timeout=timeout)
+            except queue.Empty:
+                continue
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if msg.get("id") == "clawdmeter-init":
+                initialized = True
+                if not send(rate_limits):
+                    return None
+                continue
+
+            if initialized and msg.get("id") == "clawdmeter-rate-limits":
+                result = msg.get("result")
+                break
+
+        while not err_queue.empty():
+            err_line = err_queue.get_nowait()
+            if err_line:
+                log(f"Codex app-server stderr: {err_line[:160]}")
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    if not result:
+        log("Codex rate-limit read returned no result")
+        return None
+
+    snapshots = result.get("rateLimitsByLimitId") or {}
+    snapshot = snapshots.get("codex") or result.get("rateLimits") or {}
+    primary = snapshot.get("primary") or {}
+    secondary = snapshot.get("secondary") or {}
+
+    return {
+        "s": _remaining_percent(primary.get("usedPercent")),
+        "sr": _reset_minutes_from_epoch(primary.get("resetsAt")),
+        "w": _remaining_percent(secondary.get("usedPercent")),
+        "wr": _reset_minutes_from_epoch(secondary.get("resetsAt")),
+        "st": "left",
+        "ok": True,
+    }
+
+
+def _poll_codex_usage_estimate() -> dict:
+    """Fallback estimate from the local Codex sqlite log."""
     if not CODEX_LOG_DB.exists():
         return {**_usage_error("nolog"), "t5": 0, "t7": 0}
 
@@ -312,6 +456,13 @@ def poll_codex_usage() -> dict:
         "t5": total_5h,
         "t7": total_7d,
     }
+
+
+def poll_codex_usage() -> dict:
+    official = _query_codex_rate_limits()
+    if official is not None:
+        return official
+    return _poll_codex_usage_estimate()
 
 
 async def poll_usage(token: str | None) -> dict:

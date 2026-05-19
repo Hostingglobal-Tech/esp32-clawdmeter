@@ -13,7 +13,7 @@ ESP32 Clawd Meter는 책상 위 작은 ESP32 OLED 화면에 Claude Code와 Codex
 - ESP32 OLED에 Claude Code / Codex 사용량 로테이션 표시
 - BLE GATT로 PC 데몬이 사용량 JSON 전송
 - Claude는 `Session` / `Weekly` 퍼센트와 reset 시간 표시
-- Codex는 로컬 `~/.codex/logs_2.sqlite` 기반 `5h` / `7d` 토큰 사용량 추정치 표시
+- Codex는 Codex app-server의 공식 rate-limit snapshot 기준 `5h` / `7d` 남은 한도 표시
 - 원래 Waveshare AMOLED UI와 일반 ESP32 OLED 펌웨어를 함께 보관
 - API key나 비밀번호를 펌웨어에 저장하지 않음
 
@@ -34,7 +34,7 @@ py -3.12 daemon\claude_usage_daemon.py
 
 데몬은 로컬 Claude Code 자격 정보에서 토큰을 읽어 실행 시에만 사용합니다. 토큰, API key, 비밀번호는 저장소에 넣지 마세요.
 
-Codex 사용량은 공식 quota API가 아니라 로컬 Codex 로그 기반 추정치입니다. 필요하면 아래 환경변수로 퍼센트 기준 토큰 예산을 조정할 수 있습니다.
+Codex 사용량은 Codex CLI의 app-server에서 `account/rateLimits/read`를 호출해 읽습니다. 공식 snapshot을 읽지 못할 때만 로컬 Codex 로그 기반 추정치로 fallback합니다. fallback 퍼센트 기준 토큰 예산은 아래 환경변수로 조정할 수 있습니다.
 
 ```powershell
 $env:CODEX_5H_TOKEN_BUDGET="10000000"
@@ -53,7 +53,7 @@ This fork keeps the original Waveshare AMOLED Clawdmeter firmware and adds a **g
 - Claude Code / Codex usage rotation on an ESP32 OLED
 - BLE GATT data channel from the host daemon to the ESP32
 - Claude `Session` / `Weekly` percentages plus reset time
-- Codex `5h` / `7d` token-use estimate from local `~/.codex/logs_2.sqlite`
+- Codex `5h` / `7d` remaining limits from the official Codex app-server snapshot
 - Original Waveshare AMOLED firmware and generic ESP32 OLED firmware in one repo
 - No API keys or passwords stored in firmware
 
@@ -74,7 +74,7 @@ py -3.12 daemon\claude_usage_daemon.py
 
 The daemon reads local Claude Code credentials at runtime. Do not commit tokens, API keys, passwords, logs, virtual environments, or build outputs.
 
-Codex usage is an estimate from local Codex logs, not an official quota API. Adjust the percentage budgets with environment variables when needed:
+Codex usage comes from Codex CLI's app-server via `account/rateLimits/read`. If the official snapshot is unavailable, the daemon falls back to a local Codex log estimate. Adjust fallback percentage budgets with environment variables when needed:
 
 ```powershell
 $env:CODEX_5H_TOKEN_BUDGET="10000000"
@@ -236,9 +236,11 @@ The generic ESP32 firmware also accepts the newer dual-source payload used by th
 ```json
 {
   "claude": { "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true },
-  "codex": { "s": 12, "sr": 0, "w": 34, "wr": 0, "st": "est", "ok": true, "t5": 123456, "t7": 1234567 }
+  "codex": { "s": 71, "sr": 126, "w": 35, "wr": 7742, "st": "left", "ok": true }
 }
 ```
+
+For `codex`, `s` and `w` are remaining percentages, matching the Codex analytics screen. If the daemon falls back to local log estimates, it sends `st: "est"` and optional `t5` / `t7` token counts.
 
 ## Recompiling fonts
 
