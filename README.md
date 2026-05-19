@@ -1,10 +1,74 @@
-# Clawdmeter
+# ESP32 Clawd Meter
+
+![ESP32 Clawd Meter hero](assets/esp32-clawdmeter-hero.png)
+
+## 한국어
+
+ESP32 Clawd Meter는 책상 위 작은 ESP32 OLED 화면에 Claude Code 사용량을 바로 보여주는 장치입니다. PC나 노트북의 데몬이 Claude 사용량 헤더를 읽고, Bluetooth Low Energy(BLE)로 ESP32에 보내면 OLED에 `Session`과 `Weekly` 사용률이 막대와 숫자로 표시됩니다.
+
+이 버전은 원래 Waveshare AMOLED 보드용 Clawdmeter를 **일반 ESP32-WROOM-32E + I2C OLED**에서도 쓸 수 있게 확장한 버전입니다. 제가 테스트한 보드는 `ESP32-D0WD-V3`, CP210x USB-UART, `SH1106 128x64 OLED`, `SDA=GPIO21`, `SCL=GPIO22` 구성입니다.
+
+### 핵심 기능
+
+- ESP32 OLED에 Claude 사용량 표시
+- BLE GATT로 PC 데몬이 사용량 JSON 전송
+- `Session` / `Weekly` 퍼센트와 reset 시간 표시
+- 원래 Waveshare AMOLED UI와 일반 ESP32 OLED 펌웨어를 함께 보관
+- API key나 비밀번호를 펌웨어에 저장하지 않음
+
+### 일반 ESP32 OLED 빠른 실행
+
+```bash
+cd firmware
+pio run -e generic_esp32
+pio run -e generic_esp32 -t upload --upload-port COM4
+```
+
+Windows에서 데몬을 한 번 실행하려면:
+
+```powershell
+py -3.12 -m pip install bleak httpx
+py -3.12 daemon\claude_usage_daemon.py
+```
+
+데몬은 로컬 Claude Code 자격 정보에서 토큰을 읽어 실행 시에만 사용합니다. 토큰, API key, 비밀번호는 저장소에 넣지 마세요.
+
+## English
+
+ESP32 Clawd Meter is a tiny desk dashboard that shows Claude Code usage on an ESP32 OLED display. A host daemon reads Claude usage headers, sends a small JSON payload over Bluetooth Low Energy (BLE), and the ESP32 renders `Session` and `Weekly` usage as percentages and bars.
+
+This fork keeps the original Waveshare AMOLED Clawdmeter firmware and adds a **generic ESP32-WROOM-32E + I2C OLED** firmware target. The tested board is an `ESP32-D0WD-V3` with a CP210x USB-UART bridge and an `SH1106 128x64 OLED` wired as `SDA=GPIO21`, `SCL=GPIO22`.
+
+### Features
+
+- Claude usage displayed directly on an ESP32 OLED
+- BLE GATT data channel from the host daemon to the ESP32
+- `Session` / `Weekly` percentages plus reset time
+- Original Waveshare AMOLED firmware and generic ESP32 OLED firmware in one repo
+- No API keys or passwords stored in firmware
+
+### Generic ESP32 OLED Quick Start
+
+```bash
+cd firmware
+pio run -e generic_esp32
+pio run -e generic_esp32 -t upload --upload-port COM4
+```
+
+Run the Windows daemon once:
+
+```powershell
+py -3.12 -m pip install bleak httpx
+py -3.12 daemon\claude_usage_daemon.py
+```
+
+The daemon reads local Claude Code credentials at runtime. Do not commit tokens, API keys, passwords, logs, virtual environments, or build outputs.
+
+## Original Clawdmeter Notes
 
 A small ESP32 dashboard I made for my desk to keep an eye on Claude Code usage.
 
-It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) and pairs with my laptop over Bluetooth, the splash screen plays pixel-art Clawd animations that get
-busier when your usage rate climbs. The two side buttons send Space and
-Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
+The original firmware runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) and pairs with a laptop over Bluetooth. The splash screen plays pixel-art Clawd animations that get busier when your usage rate climbs. The two side buttons send Space and Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 |              Usage meter              |              Clawd animation screen              |
 | :-----------------------------------: | :----------------------------------------------: |
