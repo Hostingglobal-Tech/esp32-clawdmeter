@@ -4,15 +4,16 @@
 
 ## 한국어
 
-ESP32 Clawd Meter는 책상 위 작은 ESP32 OLED 화면에 Claude Code 사용량을 바로 보여주는 장치입니다. PC나 노트북의 데몬이 Claude 사용량 헤더를 읽고, Bluetooth Low Energy(BLE)로 ESP32에 보내면 OLED에 `Session`과 `Weekly` 사용률이 막대와 숫자로 표시됩니다.
+ESP32 Clawd Meter는 책상 위 작은 ESP32 OLED 화면에 Claude Code와 Codex 사용량을 번갈아 보여주는 장치입니다. PC나 노트북의 데몬이 Claude 사용량 헤더와 로컬 Codex 로그를 읽고, Bluetooth Low Energy(BLE)로 ESP32에 보내면 OLED에 `Session`/`Weekly` 또는 `5h`/`7d` 사용률이 막대와 숫자로 표시됩니다.
 
 이 버전은 원래 Waveshare AMOLED 보드용 Clawdmeter를 **일반 ESP32-WROOM-32E + I2C OLED**에서도 쓸 수 있게 확장한 버전입니다. 제가 테스트한 보드는 `ESP32-D0WD-V3`, CP210x USB-UART, `SH1106 128x64 OLED`, `SDA=GPIO21`, `SCL=GPIO22` 구성입니다.
 
 ### 핵심 기능
 
-- ESP32 OLED에 Claude 사용량 표시
+- ESP32 OLED에 Claude Code / Codex 사용량 로테이션 표시
 - BLE GATT로 PC 데몬이 사용량 JSON 전송
-- `Session` / `Weekly` 퍼센트와 reset 시간 표시
+- Claude는 `Session` / `Weekly` 퍼센트와 reset 시간 표시
+- Codex는 로컬 `~/.codex/logs_2.sqlite` 기반 `5h` / `7d` 토큰 사용량 추정치 표시
 - 원래 Waveshare AMOLED UI와 일반 ESP32 OLED 펌웨어를 함께 보관
 - API key나 비밀번호를 펌웨어에 저장하지 않음
 
@@ -33,17 +34,26 @@ py -3.12 daemon\claude_usage_daemon.py
 
 데몬은 로컬 Claude Code 자격 정보에서 토큰을 읽어 실행 시에만 사용합니다. 토큰, API key, 비밀번호는 저장소에 넣지 마세요.
 
+Codex 사용량은 공식 quota API가 아니라 로컬 Codex 로그 기반 추정치입니다. 필요하면 아래 환경변수로 퍼센트 기준 토큰 예산을 조정할 수 있습니다.
+
+```powershell
+$env:CODEX_5H_TOKEN_BUDGET="10000000"
+$env:CODEX_7D_TOKEN_BUDGET="50000000"
+py -3.12 daemon\claude_usage_daemon.py
+```
+
 ## English
 
-ESP32 Clawd Meter is a tiny desk dashboard that shows Claude Code usage on an ESP32 OLED display. A host daemon reads Claude usage headers, sends a small JSON payload over Bluetooth Low Energy (BLE), and the ESP32 renders `Session` and `Weekly` usage as percentages and bars.
+ESP32 Clawd Meter is a tiny desk dashboard that rotates Claude Code and Codex usage on an ESP32 OLED display. A host daemon reads Claude usage headers and local Codex logs, sends a small JSON payload over Bluetooth Low Energy (BLE), and the ESP32 renders `Session`/`Weekly` or `5h`/`7d` usage as percentages and bars.
 
 This fork keeps the original Waveshare AMOLED Clawdmeter firmware and adds a **generic ESP32-WROOM-32E + I2C OLED** firmware target. The tested board is an `ESP32-D0WD-V3` with a CP210x USB-UART bridge and an `SH1106 128x64 OLED` wired as `SDA=GPIO21`, `SCL=GPIO22`.
 
 ### Features
 
-- Claude usage displayed directly on an ESP32 OLED
+- Claude Code / Codex usage rotation on an ESP32 OLED
 - BLE GATT data channel from the host daemon to the ESP32
-- `Session` / `Weekly` percentages plus reset time
+- Claude `Session` / `Weekly` percentages plus reset time
+- Codex `5h` / `7d` token-use estimate from local `~/.codex/logs_2.sqlite`
 - Original Waveshare AMOLED firmware and generic ESP32 OLED firmware in one repo
 - No API keys or passwords stored in firmware
 
@@ -63,6 +73,14 @@ py -3.12 daemon\claude_usage_daemon.py
 ```
 
 The daemon reads local Claude Code credentials at runtime. Do not commit tokens, API keys, passwords, logs, virtual environments, or build outputs.
+
+Codex usage is an estimate from local Codex logs, not an official quota API. Adjust the percentage budgets with environment variables when needed:
+
+```powershell
+$env:CODEX_5H_TOKEN_BUDGET="10000000"
+$env:CODEX_7D_TOKEN_BUDGET="50000000"
+py -3.12 daemon\claude_usage_daemon.py
+```
 
 ## Original Clawdmeter Notes
 
@@ -212,6 +230,15 @@ JSON payload format (written to RX):
 ```
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+
+The generic ESP32 firmware also accepts the newer dual-source payload used by the Windows daemon:
+
+```json
+{
+  "claude": { "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true },
+  "codex": { "s": 12, "sr": 0, "w": 34, "wr": 0, "st": "est", "ok": true, "t5": 123456, "t7": 1234567 }
+}
+```
 
 ## Recompiling fonts
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Claude Usage Tracker Daemon (BLE) — macOS port of claude-usage-daemon.sh.
+"""Clawdmeter Usage Tracker Daemon (BLE).
 
-Polls Claude API rate-limit headers and writes a JSON payload to the
-ESP32 "Claude Controller" peripheral over a custom GATT service. Uses
-bleak (CoreBluetooth backend on macOS).
+Polls Claude API rate-limit headers, reads local Codex token-use logs, and
+writes a JSON payload to the ESP32 "Claude Controller" peripheral over a
+custom GATT service.
 """
 
 import asyncio
@@ -12,6 +12,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -21,6 +22,7 @@ import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
+VERSION = "0.3.0"
 DEVICE_NAME = "Claude Controller"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
@@ -29,12 +31,16 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+CODEX_5H_WINDOW_SECS = 5 * 60 * 60
+CODEX_7D_WINDOW_SECS = 7 * 24 * 60 * 60
+
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+CODEX_LOG_DB = Path(os.environ.get("CODEX_USAGE_SQLITE", Path.home() / ".codex" / "logs_2.sqlite"))
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -48,6 +54,23 @@ API_BODY = {
     "max_tokens": 1,
     "messages": [{"role": "user", "content": "hi"}],
 }
+
+TOKEN_USAGE_RE = re.compile(r"(input|output)_token_count=(\d+)")
+TOTAL_TOKENS_RE = re.compile(r"codex\.turn\.token_usage\.total_tokens=(\d+)")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+CODEX_5H_TOKEN_BUDGET = _env_int("CODEX_5H_TOKEN_BUDGET", 10000000)
+CODEX_7D_TOKEN_BUDGET = _env_int("CODEX_7D_TOKEN_BUDGET", 50000000)
 
 
 def log(msg: str) -> None:
@@ -200,6 +223,111 @@ async def poll_api(token: str) -> dict | None:
     return payload
 
 
+def _usage_error(status: str) -> dict:
+    return {
+        "s": 0,
+        "sr": -1,
+        "w": 0,
+        "wr": -1,
+        "st": status[:15],
+        "ok": False,
+    }
+
+
+def _extract_codex_tokens(body: str) -> int:
+    counts = {name: int(value) for name, value in TOKEN_USAGE_RE.findall(body)}
+    if counts:
+        return counts.get("input", 0) + counts.get("output", 0)
+
+    m = TOTAL_TOKENS_RE.search(body)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def _pct_used(tokens: int, budget: int) -> int:
+    if budget <= 0:
+        return 0
+    return max(0, min(100, int(round((tokens / budget) * 100))))
+
+
+def poll_codex_usage() -> dict:
+    """Read Codex token usage from the local Codex sqlite log.
+
+    Codex does not currently expose Claude-style rate-limit headers through
+    the CLI, so this is an estimate based on local response.completed log rows.
+    The budgets are intentionally configurable via environment variables.
+    """
+    if not CODEX_LOG_DB.exists():
+        return {**_usage_error("nolog"), "t5": 0, "t7": 0}
+
+    now = int(time.time())
+    cutoff_5h = now - CODEX_5H_WINDOW_SECS
+    cutoff_7d = now - CODEX_7D_WINDOW_SECS
+    total_5h = 0
+    total_7d = 0
+
+    try:
+        db_uri = f"{CODEX_LOG_DB.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(db_uri, uri=True, timeout=2) as conn:
+            rows = conn.execute(
+                """
+                SELECT ts, feedback_log_body
+                FROM logs
+                WHERE target = 'codex_otel.trace_safe'
+                  AND ts >= ?
+                  AND feedback_log_body LIKE '%event.kind=response.completed%'
+                """,
+                (cutoff_7d,),
+            ).fetchall()
+
+            # Older builds can log only the aggregate token metric.
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT ts, feedback_log_body
+                    FROM logs
+                    WHERE ts >= ?
+                      AND feedback_log_body LIKE '%codex.turn.token_usage.total_tokens=%'
+                    """,
+                    (cutoff_7d,),
+                ).fetchall()
+    except sqlite3.Error as e:
+        log(f"Codex usage log read failed: {e}")
+        return {**_usage_error("dberr"), "t5": 0, "t7": 0}
+
+    for ts, body in rows:
+        tokens = _extract_codex_tokens(body or "")
+        total_7d += tokens
+        if int(ts) >= cutoff_5h:
+            total_5h += tokens
+
+    return {
+        "s": _pct_used(total_5h, CODEX_5H_TOKEN_BUDGET),
+        "sr": 0,
+        "w": _pct_used(total_7d, CODEX_7D_TOKEN_BUDGET),
+        "wr": 0,
+        "st": "est",
+        "ok": True,
+        "t5": total_5h,
+        "t7": total_7d,
+    }
+
+
+async def poll_usage(token: str | None) -> dict:
+    if token:
+        claude = await poll_api(token)
+        if claude is None:
+            claude = _usage_error("apierr")
+    else:
+        claude = _usage_error("noauth")
+
+    return {
+        "claude": claude,
+        "codex": poll_codex_usage(),
+    }
+
+
 class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
@@ -259,13 +387,11 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 session.refresh_requested.clear()
                 token = read_token()
                 if not token:
-                    log("No token; skipping poll")
-                else:
-                    payload = await poll_api(token)
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
+                    log("No Claude token; sending Codex/local usage only")
+                payload = await poll_usage(token)
+                if await session.write_payload(payload):
+                    last_poll = time.time()
+                    used_successfully = True
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
@@ -295,8 +421,13 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, _stop)
 
-    log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
+    log(f"=== Clawdmeter Usage Tracker Daemon v{VERSION} (BLE) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+    log(
+        "Codex estimate budgets: "
+        f"5h={CODEX_5H_TOKEN_BUDGET:,} tokens, "
+        f"7d={CODEX_7D_TOKEN_BUDGET:,} tokens"
+    )
 
     backoff = 1
     while not stop_event.is_set():
