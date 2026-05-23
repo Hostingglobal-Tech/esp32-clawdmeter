@@ -103,6 +103,22 @@ static void draw_bar(uint8_t x, uint8_t y, uint8_t w, uint8_t h, int pct) {
     if (fill_w > 0) display.drawBox(x + 1, y + 1, fill_w, h - 2);
 }
 
+// Compact "time until reset" for the 21-char bottom footer.
+// < 60m  -> "47m"
+// < 24h  -> "3h14m"
+// >=24h  -> "6d15h"
+static void format_reset_short(int mins, char *out, size_t out_len) {
+    if (mins < 0) {
+        snprintf(out, out_len, "--");
+    } else if (mins < 60) {
+        snprintf(out, out_len, "%dm", mins);
+    } else if (mins < 1440) {
+        snprintf(out, out_len, "%dh%dm", mins / 60, mins % 60);
+    } else {
+        snprintf(out, out_len, "%dd%dh", mins / 1440, (mins % 1440) / 60);
+    }
+}
+
 static void format_tokens(uint32_t tokens, char *out, size_t out_len) {
     if (tokens >= 10000000UL) {
         snprintf(out, out_len, "%luM", (unsigned long)((tokens + 500000UL) / 1000000UL));
@@ -151,12 +167,20 @@ static void draw_display(bool force = false) {
     display.drawStr(0, 43, line);
     draw_bar(0, 46, 128, 7, weekly);
 
-    if (show_codex && usage->valid && usage->session_tokens > 0) {
+    // Bottom footer: when both 5h and weekly resets are known, show them
+    // side-by-side so the user can see "limit lifts in X" for each window
+    // at a glance. Fall back to state label / device name otherwise.
+    if (usage->valid && usage->session_reset_mins >= 0 && usage->weekly_reset_mins >= 0) {
+        char r5h[8], r7d[8];
+        format_reset_short(usage->session_reset_mins, r5h, sizeof(r5h));
+        format_reset_short(usage->weekly_reset_mins, r7d, sizeof(r7d));
+        snprintf(line, sizeof(line), "5h:%s  7d:%s", r5h, r7d);
+    } else if (show_codex && usage->valid && usage->session_tokens > 0) {
         char tokens[8];
         format_tokens(usage->session_tokens, tokens, sizeof(tokens));
         snprintf(line, sizeof(line), "%s 5h %s tok", usage_state_label(usage), tokens);
     } else if (usage->valid && usage->session_reset_mins >= 0) {
-        snprintf(line, sizeof(line), "%s reset %dm", usage_state_label(usage), usage->session_reset_mins);
+        snprintf(line, sizeof(line), "5h:%dm", usage->session_reset_mins);
     } else {
         snprintf(line, sizeof(line), "%s %s", usage_state_label(usage), DEVICE_NAME);
     }
