@@ -30,7 +30,7 @@ SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
-POLL_INTERVAL = 60
+POLL_INTERVAL = int(os.environ.get("CLAWDMETER_POLL_INTERVAL", "300"))  # 사장님 룰 2026-05-21: 60s→300s (부하 감소)
 TICK = 5
 SCAN_TIMEOUT = 8.0
 CODEX_5H_WINDOW_SECS = 5 * 60 * 60
@@ -194,7 +194,11 @@ async def poll_api(token: str) -> dict | None:
         return None
     if resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
-        return None
+        # Anthropic emits rate-limit headers even on 429. Bail only if they're
+        # absent — otherwise the meter would fall back to 0% precisely when
+        # the bar should be pegged at 100%.
+        if "anthropic-ratelimit-unified-5h-utilization" not in resp.headers:
+            return None
 
     def hdr(name: str, default: str = "0") -> str:
         return resp.headers.get(name, default)
@@ -261,10 +265,12 @@ def _reset_minutes_from_epoch(reset_ts: int | float | None) -> int:
     return int(round(mins)) if mins > 0 else 0
 
 
-def _remaining_percent(used: int | float | None) -> int:
+def _used_percent_clamp(used: int | float | None) -> int:
+    # UI semantic is "used %" (see firmware/src/data.h and pct_color thresholds).
+    # Keep Codex official aligned with Claude: high bar = high usage.
     if used is None:
         return 0
-    return max(0, min(100, int(round(100 - float(used)))))
+    return max(0, min(100, int(round(float(used)))))
 
 
 def _reader_thread(stream, out_queue: queue.Queue[str]) -> None:
@@ -391,11 +397,11 @@ def _query_codex_rate_limits() -> dict | None:
     secondary = snapshot.get("secondary") or {}
 
     return {
-        "s": _remaining_percent(primary.get("usedPercent")),
+        "s": _used_percent_clamp(primary.get("usedPercent")),
         "sr": _reset_minutes_from_epoch(primary.get("resetsAt")),
-        "w": _remaining_percent(secondary.get("usedPercent")),
+        "w": _used_percent_clamp(secondary.get("usedPercent")),
         "wr": _reset_minutes_from_epoch(secondary.get("resetsAt")),
-        "st": "left",
+        "st": "ok",
         "ok": True,
     }
 
