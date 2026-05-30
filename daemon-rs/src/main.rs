@@ -7,10 +7,17 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::os::windows::process::CommandExt;
+use std::process::Stdio;
+
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::Manager;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use uuid::Uuid;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const DEVICE_NAME: &str = "Claude Controller";
 const RX_UUID_STR: &str = "4c41555a-4465-7669-6365-000000000002"; // host writes JSON here
@@ -173,12 +180,112 @@ fn codex_estimate() -> Value {
     })
 }
 
+fn codex_cmd_path() -> String {
+    if let Ok(c) = std::env::var("CODEX_CMD") {
+        if !c.is_empty() {
+            return c;
+        }
+    }
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    format!(r"{appdata}\npm\codex.cmd")
+}
+
+/// Official Codex rate limits via `codex app-server` JSON-RPC over stdio.
+/// secondary.usedPercent = weekly (the real figure); primary = 5h.
+async fn codex_official() -> Option<Value> {
+    let mut child = Command::new(codex_cmd_path())
+        .args(["app-server", "--listen", "stdio://"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let init = json!({"jsonrpc":"2.0","id":"clawdmeter-init","method":"initialize",
+        "params":{"clientInfo":{"name":"clawdmeter","title":"Clawdmeter","version":"0.4.0"},"capabilities":null}});
+    stdin.write_all((init.to_string() + "\n").as_bytes()).await.ok()?;
+    stdin.flush().await.ok()?;
+
+    let mut initialized = false;
+    let mut result: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let line = match tokio::time::timeout(remaining, lines.next_line()).await {
+            Ok(Ok(Some(l))) => l,
+            _ => break,
+        };
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let id = msg.get("id").and_then(|x| x.as_str());
+        if id == Some("clawdmeter-init") {
+            initialized = true;
+            let rl = json!({"jsonrpc":"2.0","id":"clawdmeter-rate-limits","method":"account/rateLimits/read"});
+            stdin.write_all((rl.to_string() + "\n").as_bytes()).await.ok()?;
+            stdin.flush().await.ok()?;
+            continue;
+        }
+        if initialized && id == Some("clawdmeter-rate-limits") {
+            result = msg.get("result").cloned();
+            break;
+        }
+    }
+    let _ = child.start_kill();
+
+    let result = result?;
+    let snap = result
+        .get("rateLimitsByLimitId")
+        .and_then(|m| m.get("codex"))
+        .cloned()
+        .or_else(|| result.get("rateLimits").cloned())?;
+    let now = now_secs();
+    let upct = |o: &Value| {
+        o.get("usedPercent").and_then(|x| x.as_f64()).map(|f| (f.round() as i64).clamp(0, 100)).unwrap_or(0)
+    };
+    let rmin = |o: &Value| {
+        o.get("resetsAt")
+            .and_then(|x| x.as_f64())
+            .map(|r| {
+                let m = (r - now) / 60.0;
+                if m > 0.0 { m.round() as i64 } else { 0 }
+            })
+            .unwrap_or(-1)
+    };
+    let prim = snap.get("primary").cloned().unwrap_or_else(|| json!({}));
+    let sec = snap.get("secondary").cloned().unwrap_or_else(|| json!({}));
+    Some(json!({
+        "s": upct(&prim), "sr": rmin(&prim),
+        "w": upct(&sec), "wr": rmin(&sec),
+        "st": "ok", "ok": true
+    }))
+}
+
+/// Codex usage: official rate limits first, sqlite token estimate as fallback.
+async fn codex_usage() -> Value {
+    match codex_official().await {
+        Some(v) => v,
+        None => {
+            log("Codex official unavailable — using sqlite estimate");
+            codex_estimate()
+        }
+    }
+}
+
 async fn build_payload(http: &reqwest::Client) -> Value {
     let claude = match read_token() {
         Some(t) => poll_claude(http, &t).await,
         None => err_usage("noauth"),
     };
-    json!({"claude": claude, "codex": codex_estimate()})
+    json!({"claude": claude, "codex": codex_usage().await})
 }
 
 async fn run_session(http: &reqwest::Client, rx_uuid: Uuid) -> Result<(), Box<dyn std::error::Error>> {
