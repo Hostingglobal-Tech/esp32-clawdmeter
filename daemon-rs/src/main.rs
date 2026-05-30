@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"] // no console window (runs from Startup shortcut)
+
 // Clawdmeter usage daemon (Rust port of claude_usage_daemon.py).
 // Polls Claude API rate-limit headers + Codex sqlite log, writes nested JSON
 // {"claude":{...},"codex":{...}} to the ESP32 "Claude Controller" over BLE GATT.
@@ -21,7 +23,15 @@ const CODEX_5H_BUDGET: i64 = 10_000_000;
 const CODEX_7D_BUDGET: i64 = 50_000_000;
 
 fn log(m: &str) {
-    println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), m);
+    use std::io::Write;
+    let line = format!("[{}] {}\n", chrono::Local::now().format("%H:%M:%S"), m);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\DEVEL\Clawdmeter\clawdmeter-rs.out.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn now_secs() -> f64 {
