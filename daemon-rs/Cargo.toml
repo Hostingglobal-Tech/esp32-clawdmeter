@@ -1,0 +1,20 @@
+[package]
+name = "clawdmeter-daemon"
+version = "0.4.0"
+edition = "2021"
+description = "Clawdmeter usage daemon (Rust) — polls Claude API + Codex sqlite, sends JSON to ESP32 over BLE"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+btleplug = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+regex = "1"
+uuid = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 2
+strip = true

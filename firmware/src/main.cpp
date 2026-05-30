@@ -163,12 +163,15 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->ok = doc["ok"] | false;
+    // Daemon sends nested {"claude":{...},"codex":{...}}; older payloads were flat
+    // ({"s":...} at root). Prefer the "claude" object, fall back to root so both parse.
+    JsonVariantConst src = doc["claude"].isNull() ? doc.as<JsonVariantConst>() : doc["claude"];
+    out->session_pct = src["s"] | 0.0f;
+    out->session_reset_mins = src["sr"] | -1;
+    out->weekly_pct = src["w"] | 0.0f;
+    out->weekly_reset_mins = src["wr"] | -1;
+    strlcpy(out->status, src["st"] | "unknown", sizeof(out->status));
+    out->ok = src["ok"] | false;
     out->valid = true;
     return true;
 }
